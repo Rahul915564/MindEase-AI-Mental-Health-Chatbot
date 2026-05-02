@@ -2,9 +2,9 @@ import { Router, type IRouter } from "express";
 import { getAuth } from "@clerk/express";
 import { db } from "@workspace/db";
 import { conversations as conversationsTable, messages as messagesTable } from "@workspace/db";
-import { CreateConversationBody, SendOpenaiMessageBody, GetConversationMessagesParams } from "@workspace/api-zod";
+import { CreateConversationBody, SendOpenaiMessageBody } from "@workspace/api-zod";
 import { eq, and, asc, desc } from "drizzle-orm";
-import { openai } from "@workspace/integrations-openai-ai-server";
+import { generateResponse, simulateStream } from "./chatEngine";
 
 const router: IRouter = Router();
 
@@ -18,12 +18,12 @@ const requireAuth = (req: any, res: any, next: any) => {
 
 router.get("/openai/conversations", requireAuth, async (req: any, res) => {
   try {
-    const conversations = await db
+    const convos = await db
       .select()
       .from(conversationsTable)
       .where(eq(conversationsTable.userId, req.userId))
       .orderBy(desc(conversationsTable.updatedAt));
-    res.json(conversations);
+    res.json(convos);
   } catch (err) {
     req.log.error({ err }, "Error fetching conversations");
     res.status(500).json({ error: "Internal server error" });
@@ -51,12 +51,12 @@ router.get("/openai/conversations/:id/messages", requireAuth, async (req: any, r
       .where(and(eq(conversationsTable.id, id), eq(conversationsTable.userId, req.userId)));
     if (!convo) return res.status(404).json({ error: "Not found" });
 
-    const messages = await db
+    const msgs = await db
       .select()
       .from(messagesTable)
       .where(eq(messagesTable.conversationId, id))
       .orderBy(asc(messagesTable.createdAt));
-    res.json(messages);
+    res.json(msgs);
   } catch (err) {
     req.log.error({ err }, "Error fetching messages");
     res.status(500).json({ error: "Internal server error" });
@@ -72,65 +72,38 @@ router.post("/openai/conversations/:id/messages", requireAuth, async (req: any, 
 
     const body = SendOpenaiMessageBody.parse(req.body);
 
-    // Save user message
     await db.insert(messagesTable).values({
       conversationId: id,
       role: "user",
       content: body.content,
     });
 
-    // Get conversation history
-    const history = await db
-      .select()
-      .from(messagesTable)
-      .where(eq(messagesTable.conversationId, id))
-      .orderBy(asc(messagesTable.createdAt));
-
-    const chatMessages = [
-      {
-        role: "system" as const,
-        content: `You are MindEase, a compassionate mental health support AI. You help users with stress, anxiety, and emotional wellbeing. Be warm, empathetic, and supportive. Offer practical coping strategies when appropriate. Always remind users that you are an AI and encourage professional help for serious concerns. You can respond in both Hindi and English based on what language the user writes in.`,
-      },
-      ...history.map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      })),
-    ];
+    const botReply = generateResponse(body.content);
 
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
 
-    let fullResponse = "";
-    const stream = await openai.chat.completions.create({
-      model: "gpt-5.4",
-      max_completion_tokens: 8192,
-      messages: chatMessages,
-      stream: true,
-    });
+    simulateStream(
+      botReply,
+      (chunk) => {
+        res.write(`data: ${JSON.stringify({ content: chunk })}\n\n`);
+      },
+      async () => {
+        await db.insert(messagesTable).values({
+          conversationId: id,
+          role: "assistant",
+          content: botReply,
+        });
 
-    for await (const chunk of stream) {
-      const content = chunk.choices[0]?.delta?.content;
-      if (content) {
-        fullResponse += content;
-        res.write(`data: ${JSON.stringify({ content })}\n\n`);
+        await db.update(conversationsTable)
+          .set({ updatedAt: new Date() })
+          .where(eq(conversationsTable.id, id));
+
+        res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+        res.end();
       }
-    }
-
-    // Save assistant message
-    await db.insert(messagesTable).values({
-      conversationId: id,
-      role: "assistant",
-      content: fullResponse,
-    });
-
-    // Update conversation updatedAt
-    await db.update(conversationsTable)
-      .set({ updatedAt: new Date() })
-      .where(eq(conversationsTable.id, id));
-
-    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
-    res.end();
+    );
   } catch (err) {
     req.log.error({ err }, "Error sending message");
     res.status(500).json({ error: "Internal server error" });
