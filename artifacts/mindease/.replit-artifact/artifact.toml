@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "MindEase"
+version = "1.0.0"
+id = "artifacts/mindease"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19476
+
+[services.development]
+run = "pnpm --filter @workspace/mindease run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/mindease", "run", "build" ]
+publicDir = "artifacts/mindease/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19476"
+BASE_PATH = "/"
